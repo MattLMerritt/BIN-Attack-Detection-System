@@ -310,6 +310,97 @@ class Alert:
 
 
 # ---------------------
+# BIN Similarity Graph
+# ---------------------
+
+class BINGraph:
+    """
+    Lightweight graph to track BIN similarity relationships.
+    Nodes represent BINs, and edges represent Jaccard similarity scores.
+    """
+    def __init__(self, decay_rate: float = 0.01, similarity_threshold: float = 0.5):
+        """
+        Initialize the BIN graph.
+
+        Args:
+            decay_rate: Rate at which edge weights decay over time.
+            similarity_threshold: Minimum similarity score to maintain an edge.
+        """
+        self.graph: Dict[str, Dict[str, float]] = {}
+        self.decay_rate = decay_rate
+        self.similarity_threshold = similarity_threshold
+
+    def add_or_update_edge(self, bin1: str, bin2: str, similarity: float) -> None:
+        """
+        Add or update an edge between two BINs.
+
+        Args:
+            bin1: First BIN ID.
+            bin2: Second BIN ID.
+            similarity: Jaccard similarity score.
+        """
+        if bin1 == bin2:
+            return  # No self-loops
+
+        if bin1 not in self.graph:
+            self.graph[bin1] = {}
+        if bin2 not in self.graph:
+            self.graph[bin2] = {}
+
+        self.graph[bin1][bin2] = similarity
+        self.graph[bin2][bin1] = similarity
+
+    def decay_edges(self) -> None:
+        """
+        Decay edge weights over time and prune edges below the threshold.
+        """
+        to_remove = []
+
+        for bin1, neighbors in self.graph.items():
+            for bin2, weight in neighbors.items():
+                # Decay the weight
+                new_weight = weight * (1 - self.decay_rate)
+                if new_weight < self.similarity_threshold:
+                    to_remove.append((bin1, bin2))
+                else:
+                    self.graph[bin1][bin2] = new_weight
+
+        # Remove edges below the threshold
+        for bin1, bin2 in to_remove:
+            del self.graph[bin1][bin2]
+            if not self.graph[bin1]:
+                del self.graph[bin1]
+
+            del self.graph[bin2][bin1]
+            if not self.graph[bin2]:
+                del self.graph[bin2]
+
+    def get_clusters(self) -> List[Set[str]]:
+        """
+        Identify clusters of connected BINs.
+
+        Returns:
+            List of sets, where each set contains BIN IDs in a cluster.
+        """
+        visited = set()
+        clusters = []
+
+        def dfs(bin_id, cluster):
+            visited.add(bin_id)
+            cluster.add(bin_id)
+            for neighbor in self.graph.get(bin_id, {}):
+                if neighbor not in visited:
+                    dfs(neighbor, cluster)
+
+        for bin_id in self.graph:
+            if bin_id not in visited:
+                cluster = set()
+                dfs(bin_id, cluster)
+                clusters.append(cluster)
+
+        return clusters
+
+# ---------------------
 # Detection System
 # ---------------------
 
@@ -324,7 +415,8 @@ class BINAttackDetector:
         self, 
         hot_bin_threshold: float = 0.1,
         similarity_threshold: float = 0.5,
-        check_interval: int = 100
+        check_interval: int = 100,
+        graph_decay_rate: float = 0.01
     ):
         """
         Initialize the BIN attack detector.
@@ -333,6 +425,7 @@ class BINAttackDetector:
             hot_bin_threshold: Threshold for marking a BIN as "hot" (proportion of traffic)
             similarity_threshold: Threshold for considering two BINs as having similar IP sets
             check_interval: Number of events to process before running detection rules
+            graph_decay_rate: Rate at which edge weights decay over time
         """
         # Configuration
         self.hot_bin_threshold = hot_bin_threshold
@@ -351,6 +444,12 @@ class BINAttackDetector:
         # Statistics
         self.total_events = 0
         self.start_time = time.time()
+
+        # BIN similarity graph
+        self.bin_graph = BINGraph(
+            decay_rate=graph_decay_rate, 
+            similarity_threshold=similarity_threshold
+        )
     
     def process_event(self, bin_id: str, ip: str) -> None:
         """
@@ -388,8 +487,18 @@ class BINAttackDetector:
         # 2. Check for similar IP sets across BINs
         similar_bin_pairs = self._identify_similar_bin_pairs()
         
-        # 3. Generate alerts based on findings
+        # 3. Update the BIN similarity graph
+        for bin_id1, bin_id2, similarity in similar_bin_pairs:
+            self.bin_graph.add_or_update_edge(bin_id1, bin_id2, similarity)
+
+        # Decay edges in the graph
+        self.bin_graph.decay_edges()
+
+        # 4. Generate alerts based on findings
         self._generate_alerts(hot_bins, similar_bin_pairs)
+
+        # 5. Apply graph-based rules
+        self._apply_graph_rules()
     
     def _identify_hot_bins(self) -> List[str]:
         """
@@ -519,6 +628,63 @@ class BINAttackDetector:
                         "attack_confidence": min(0.99, similarity * 1.5),  # Simple heuristic
                     }
                 ))
+
+    def _apply_graph_rules(self) -> None:
+        """
+        Apply rules to the BIN similarity graph to detect coordinated patterns.
+        """
+        clusters = self.bin_graph.get_clusters()
+
+        for cluster in clusters:
+            # Look for clusters with 3+ BINs and at least one hot BIN
+            hot_bins_in_cluster = [bin_id for bin_id in cluster if bin_id in self.bin_states and self.bin_states[bin_id].is_hot]
+
+            if len(cluster) >= 3 and hot_bins_in_cluster:
+                # Check if the cluster has high average similarity
+                total_similarity = 0
+                edge_count = 0
+
+                for bin1 in cluster:
+                    for bin2, weight in self.bin_graph.graph.get(bin1, {}).items():
+                        if bin2 in cluster:
+                            total_similarity += weight
+                            edge_count += 1
+
+                average_similarity = total_similarity / edge_count if edge_count > 0 else 0
+
+                if average_similarity > self.similarity_threshold:
+                    self.alerts.append(Alert(
+                        timestamp=time.time(),
+                        alert_type="COORDINATED_CLUSTER_ATTACK",
+                        severity="high",
+                        bin_ids=list(cluster),
+                        details={
+                            "hot_bins": hot_bins_in_cluster,
+                            "cluster_size": len(cluster),
+                            "graph_density": self._calculate_cluster_density(cluster),
+                            "average_similarity": average_similarity
+                        }
+                    ))
+
+    def _calculate_cluster_density(self, cluster: Set[str]) -> float:
+        """
+        Calculate the density of a cluster in the BIN graph.
+
+        Args:
+            cluster: Set of BIN IDs in the cluster.
+
+        Returns:
+            Density of the cluster (0.0 to 1.0).
+        """
+        edges = 0
+        possible_edges = len(cluster) * (len(cluster) - 1) / 2
+
+        for bin1 in cluster:
+            for bin2 in self.bin_graph.graph.get(bin1, {}):
+                if bin2 in cluster:
+                    edges += 1
+
+        return edges / possible_edges if possible_edges > 0 else 0.0
     
     def get_stats(self) -> dict:
         """Get statistics about the current state of the detector."""
@@ -574,6 +740,10 @@ class BINAttackDetector:
             elif alert.alert_type == "COORDINATED_ATTACK":
                 print(f"    Similarity: {alert.details['similarity']:.2f}")
                 print(f"    Attack confidence: {alert.details['attack_confidence']:.2%}")
+            elif alert.alert_type == "COORDINATED_CLUSTER_ATTACK":
+                print(f"    Hot BINs: {', '.join(alert.details['hot_bins'])}")
+                print(f"    Cluster size: {alert.details['cluster_size']}")
+                print(f"    Graph density: {alert.details['graph_density']:.2f}")
             
             print()  # Empty line between alerts
 
