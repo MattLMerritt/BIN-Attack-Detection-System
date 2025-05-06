@@ -762,12 +762,12 @@ def simulate_traffic(
     num_bins: int = 10,
     num_ips: int = 1000,
     normal_behavior_ratio: float = 0.7,
-    attack_similarity: float = 0.6,
+    attack_similarity: float = 0.8,
     print_progress: bool = True
 ) -> None:
     """
     Simulate traffic for testing the detector.
-    
+
     Args:
         detector: The BINAttackDetector instance
         num_events: Total number of events to simulate
@@ -779,66 +779,80 @@ def simulate_traffic(
     """
     # Generate BIN IDs
     bin_ids = [f"BIN{i:06d}" for i in range(num_bins)]
-    
+
     # Generate IPs
     all_ips = [generate_random_ip() for _ in range(num_ips)]
-    
+
     # Create sets of IPs for normal behavior
     normal_traffic_ips = {}
     for bin_id in bin_ids:
         # Each BIN gets a random subset of IPs
         ip_count = random.randint(50, 200)
         normal_traffic_ips[bin_id] = set(random.sample(all_ips, ip_count))
+
+    # Create attack IPs - shared across multiple BINs to ensure overlap
+    # Ensure at least 5 BINs are targeted by attack traffic
+    attack_target_count = max(5, min(num_bins, int(num_bins * 0.7)))  # Increase to 70% of all BINs
+    attack_target_bins = random.sample(bin_ids, attack_target_count)
     
-    # Create attack IPs - some shared across a few BINs
-    attack_target_bins = random.sample(bin_ids, min(3, num_bins))
-    attack_base_ips = set(random.sample(all_ips, int(num_ips * 0.1)))  # 10% of IPs are attackers
+    # Increase the attack base to ensure more overlap
+    attack_base_ips = set(random.sample(all_ips, int(num_ips * 0.4)))  # 40% of IPs are attackers
+
+    # Create a common core of attack IPs that will be shared across all targeted BINs
+    # This ensures high similarity between attack patterns
+    common_attack_core = set(random.sample(list(attack_base_ips), int(len(attack_base_ips) * 0.9)))  # Increase to 90% shared
     
     attack_ips = {}
     for bin_id in attack_target_bins:
-        # Share some IPs across attack targets
-        shared_ips = set(random.sample(list(attack_base_ips), 
-                                     int(len(attack_base_ips) * attack_similarity)))
-        # Add some unique IPs
-        unique_ips = set(random.sample(all_ips, int(num_ips * 0.05)))
-        attack_ips[bin_id] = shared_ips.union(unique_ips)
+        # Ensure high similarity (0.9 or higher) by sharing a very large portion of IPs
+        # The core is shared across all attack targets
+        shared_ips = common_attack_core.copy()
+        
+        # Add very few bin-specific IPs to maintain extremely high similarity
+        remaining_attack_ips = attack_base_ips - common_attack_core
+        bin_specific_ips = set(random.sample(list(remaining_attack_ips), 
+                                           min(len(remaining_attack_ips), int(len(common_attack_core) * 0.05))))  # Only 5% unique
+        
+        # Combine shared and bin-specific IPs
+        attack_ips[bin_id] = shared_ips.union(bin_specific_ips)
     
-    # Make one BIN particularly hot
-    hot_bin = random.choice(bin_ids)
-    
+    # Make multiple BINs "hot" with significantly higher traffic
+    # Choose 3 of the attack targets to be hot
+    hot_bins = random.sample(attack_target_bins, min(3, len(attack_target_bins)))
+
     # Process events
     progress_step = max(1, num_events // 20)
-    
+
     for i in range(num_events):
         # Determine if this is an attack event
         is_attack = random.random() > normal_behavior_ratio
-        
+
         if is_attack and attack_ips:
             # Choose a BIN that's under attack
             bin_id = random.choice(list(attack_ips.keys()))
             # Choose an IP from the attack set for this BIN
             ip = random.choice(list(attack_ips[bin_id]))
         else:
-            # Normal traffic - random BIN with bias toward hot BIN
-            if random.random() < 0.3:  # 30% chance to hit the hot BIN
-                bin_id = hot_bin
+            # Normal traffic - random BIN with stronger bias toward hot BINs
+            if random.random() < 0.6:  # 60% chance to hit one of the hot BINs
+                bin_id = random.choice(hot_bins)
             else:
                 bin_id = random.choice(bin_ids)
-            
+
             # Use an IP from the normal set for this BIN, or a random one
             if bin_id in normal_traffic_ips and normal_traffic_ips[bin_id] and random.random() < 0.9:
                 ip = random.choice(list(normal_traffic_ips[bin_id]))
             else:
                 ip = random.choice(all_ips)
-        
+
         # Process the event
         detector.process_event(bin_id, ip)
-        
+
         # Print progress
         if print_progress and i % progress_step == 0:
             percent = (i / num_events) * 100
             print(f"\rSimulating traffic: {percent:.1f}% complete", end="")
-    
+
     if print_progress:
         print("\rSimulating traffic: 100.0% complete")
 
